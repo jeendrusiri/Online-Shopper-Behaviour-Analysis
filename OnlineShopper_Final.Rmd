@@ -1,0 +1,826 @@
+---
+title: "E-Commerce Customer Behaviour Analysis and Purchase Prediction Using R"
+subtitle: "Introduction to Data Science: Case Study Report"
+author: "Siri Jeendru"
+date: "2026-10-25"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+# Global options for every code chunk:
+#   echo = TRUE    -> show the R code in the report
+#   message = FALSE -> hide package start-up messages
+#   warning = TRUE -> keep any warnings visible, so problems are not hidden
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = TRUE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center"
+)
+```
+
+```{r packages, echo=FALSE}
+# Step 1: Load the required packages.
+# Packages are NOT installed here (installing on every knit is slow and
+# can fail without internet). If one is missing, we stop with a clear message.
+required_packages <- c("dplyr", "ggplot2", "knitr", "rmarkdown")
+missing_packages  <- required_packages[!vapply(required_packages, requireNamespace,
+                                                logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop("Please install the missing package(s) once in the Console, then knit again:\n",
+       "install.packages(c(", paste0('"', missing_packages, '"', collapse = ", "), "))")
+}
+
+library(dplyr)
+library(ggplot2)
+```
+
+# Case Study Overview
+
+**Problem.** An e-commerce website records every visitor session: which pages were
+opened, how long the visitor stayed, and whether they left quickly. Most sessions do
+not end in a purchase. The business wants to know which session behaviours are
+associated with buying, and whether a simple model can predict if a session will end
+in a purchase.
+
+**Background.** Every visit leaves behavioural clues such as product pages viewed, time
+spent, bounce and exit rates, visitor type and month. Data science can turn these
+clues into patterns and a yes/no purchase prediction that helps a business improve its
+pages and plan offers.
+
+**Objectives**
+
+1. Analyze online shopper session behaviour using the dataset.
+2. Identify behavioural factors associated with purchase completion.
+3. Visualize patterns between session characteristics and the purchase outcome.
+4. Develop and evaluate a Logistic Regression model that predicts whether a session results in a purchase.
+
+**What we predict.** The target is `Revenue`: `TRUE` if the session ended in a purchase,
+`FALSE` otherwise. It is a yes/no (binary) outcome, not an amount of money.
+
+# Dataset
+
+```{r load-data}
+# Step 2: Read the dataset.
+# The CSV must be in the SAME folder as this .Rmd file.
+# (The original script used choose.files(), which opens a pop-up window and
+#  cannot run while knitting, so a fixed file name is used here.)
+data_file <- "online_shoppers_intention.csv"
+if (!file.exists(data_file)) {
+  stop("Cannot find '", data_file, "'. Put the CSV in the same folder as this .Rmd file.")
+}
+data <- read.csv(data_file)
+```
+
+* **Name:** Online Shoppers Purchasing Intention Dataset
+* **Source:** UCI Machine Learning Repository (Sakar & Kastro, 2018), <https://doi.org/10.24432/C5F88Q>
+* **Size:** `r format(nrow(data), big.mark = ",")` sessions (rows) and `r ncol(data)` variables (columns). One row is one shopping session.
+* **Target:** `Revenue` (purchase made: TRUE / FALSE)
+
+**Why it suits this case study:** it records real online shopping sessions, contains
+behavioural variables, and its target directly records whether a purchase happened.
+That makes it suitable for both behaviour analysis and binary purchase prediction.
+
+```{r inspect}
+# Step 3: Inspect the dataset (size, first rows, variable types).
+dim(data)
+head(data[, 1:9])   # first 9 columns (all 18 do not fit on one line)
+
+# A compact table of every variable and its type as read by R
+data.frame(
+  Variable = names(data),
+  R_type   = vapply(data, function(x) class(x)[1], character(1)),
+  Example  = vapply(data, function(x) as.character(x[1]), character(1)),
+  row.names = NULL
+)
+```
+
+**Important variables.** `Administrative`, `Informational` and `ProductRelated` count the
+pages of each type viewed, and their `_Duration` columns give the time spent on them.
+`BounceRates`, `ExitRates` and `PageValues` are Google Analytics measures for the pages
+visited. `SpecialDay` measures closeness to a special day such as Valentine's Day.
+`Month`, `VisitorType` and `Weekend` describe when and by whom the visit was made.
+`OperatingSystems`, `Browser`, `Region` and `TrafficType` are stored as numbers but are
+really category codes.
+
+# Data Preparation
+
+## Missing values
+
+```{r missing}
+# Step 4: Check missing values in every column.
+colSums(is.na(data))
+```
+
+The dataset has **`r sum(is.na(data))` missing values**, which matches the information on
+the UCI page. No imputation is needed.
+
+## Duplicate rows
+
+```{r duplicates}
+# Step 5: Count duplicate rows (rows identical in all 18 columns).
+sum(duplicated(data))
+
+# Step 6: Inspect the duplicate rows.
+duplicate_rows <- data[duplicated(data), ]
+head(duplicate_rows[, c("ProductRelated", "ProductRelated_Duration",
+                        "BounceRates", "ExitRates", "PageValues", "Revenue")])
+
+# Purchase outcome among the duplicate rows
+table(duplicate_rows$Revenue)
+
+# How many duplicates are very short "bounce" sessions?
+# (bounce rate and exit rate both 0.2, at most 1 product page, 0 seconds on product pages)
+sum(duplicate_rows$BounceRates == 0.2 & duplicate_rows$ExitRates == 0.2 &
+    duplicate_rows$ProductRelated <= 1 & duplicate_rows$ProductRelated_Duration == 0)
+```
+
+**Decision: duplicates are kept, not removed.** There are `r sum(duplicated(data))`
+duplicate rows. All of them are non-purchase sessions with bounce and exit rate 0.2,
+and almost all are one-page visits with no time recorded. UCI states that each
+session belongs to a different user. So these rows most likely are *different* visitors
+whose very short visits happened to produce identical values, not copying errors.
+Removing them would hide real (and common) quick-exit behaviour. Section 5.8 checks
+that keeping them does not change the conclusions.
+
+## Numerical variables and value ranges
+
+```{r ranges}
+# Step 7: Summary of numerical variables (minimum, median, mean, maximum).
+numeric_vars <- names(data)[sapply(data, is.numeric)]
+numeric_summary <- data.frame(
+  Variable = numeric_vars,
+  Min    = sapply(data[numeric_vars], min),
+  Median = sapply(data[numeric_vars], median),
+  Mean   = round(sapply(data[numeric_vars], mean), 2),
+  Max    = sapply(data[numeric_vars], max),
+  row.names = NULL
+)
+numeric_summary
+
+# Check that the rates are inside their valid range (0 to 1)
+range(data$BounceRates)
+range(data$ExitRates)
+range(data$PageValues)
+# Durations and page counts should never be negative
+any(data[, c("Administrative_Duration", "Informational_Duration",
+             "ProductRelated_Duration")] < 0)
+```
+
+No incorrect values were found: bounce and exit rates lie between 0 and 1, and no
+duration is negative. Several variables (durations, `PageValues`) are strongly
+**right-skewed**: most sessions have small values and a few have very large values.
+These large values are plausible (for example, a long shopping session), so they are
+kept as they are, and no transformation was applied.
+
+## Converting categorical variables to factors
+
+```{r factors}
+# Step 8: Convert categorical variables to factors.
+# OperatingSystems, Browser, Region and TrafficType are number CODES (labels),
+# not quantities, so R must treat them as categories.
+data$OperatingSystems <- as.factor(data$OperatingSystems)
+data$Browser          <- as.factor(data$Browser)
+data$Region           <- as.factor(data$Region)
+data$TrafficType      <- as.factor(data$TrafficType)
+
+data$Month       <- as.factor(data$Month)
+data$VisitorType <- as.factor(data$VisitorType)
+data$Weekend     <- as.factor(data$Weekend)
+data$Revenue     <- as.factor(data$Revenue)   # target: levels "FALSE", "TRUE"
+
+# Verify the updated data types
+str(data)
+```
+
+Note: `Month` has only `r nlevels(data$Month)` levels because the dataset contains
+no January or April sessions. `June` is written in full while the other months are
+abbreviated; this is how the data comes from UCI.
+
+# Data Analysis and Visualization
+
+## Purchase vs non-purchase sessions
+
+```{r plot-revenue}
+# Step 9: Purchase vs Non-Purchase Sessions
+ggplot(data, aes(x = Revenue, fill = Revenue)) +
+  geom_bar() +
+  labs(
+    title = "Purchase vs Non-Purchase Sessions",
+    x = "Purchase Outcome",
+    y = "Number of Sessions",
+    fill = "Revenue"
+  ) +
+  theme_minimal()
+
+# Counts and percentages
+revenue_table <- data %>%
+  count(Revenue, name = "Sessions") %>%
+  mutate(Percent = round(100 * Sessions / sum(Sessions), 2))
+revenue_table
+```
+
+**Interpretation:** only `r revenue_table$Percent[revenue_table$Revenue == "TRUE"]`% of
+sessions end in a purchase. The classes are **imbalanced**, so accuracy alone can be
+misleading: a model that always predicts "no purchase" would already be about
+`r round(revenue_table$Percent[revenue_table$Revenue == "FALSE"])`% accurate. That is why precision, recall and
+F1-score are also reported in Section 5.
+
+## Bounce rate and exit rate
+
+```{r plot-bounce}
+# Step 10A: Bounce Rate by Purchase Outcome
+ggplot(data, aes(x = Revenue, y = BounceRates, fill = Revenue)) +
+  geom_boxplot() +
+  labs(
+    title = "Bounce Rate by Purchase Outcome",
+    x = "Purchase Outcome",
+    y = "Bounce Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-exit}
+# Step 10B: Exit Rate by Purchase Outcome
+ggplot(data, aes(x = Revenue, y = ExitRates, fill = Revenue)) +
+  geom_boxplot() +
+  labs(
+    title = "Exit Rate by Purchase Outcome",
+    x = "Purchase Outcome",
+    y = "Exit Rate"
+  ) +
+  theme_minimal()
+
+# Median and mean of each rate for the two groups
+rate_summary <- data %>%
+  group_by(Revenue) %>%
+  summarise(
+    Median_BounceRate = round(median(BounceRates), 4),
+    Mean_BounceRate   = round(mean(BounceRates), 4),
+    Median_ExitRate   = round(median(ExitRates), 4),
+    Mean_ExitRate     = round(mean(ExitRates), 4)
+  )
+rate_summary
+```
+
+**Interpretation:** sessions that end in a purchase have clearly **lower bounce and exit
+rates** (mean exit rate `r rate_summary$Mean_ExitRate[rate_summary$Revenue == "TRUE"]`
+for purchases vs `r rate_summary$Mean_ExitRate[rate_summary$Revenue == "FALSE"]` for
+non-purchases). The points above the boxes are sessions with unusually high rates.
+At the maximum value of 0.2 (visitors who left almost immediately) there are
+`r sum(data$BounceRates == 0.2 & data$Revenue == "FALSE")` non-purchase sessions but only
+`r sum(data$BounceRates == 0.2 & data$Revenue == "TRUE")` purchase session(s).
+
+## Purchase outcome by visitor type
+
+```{r plot-visitor}
+# Purchase outcome by visitor type (each bar adds up to 1)
+ggplot(data, aes(x = VisitorType, fill = Revenue)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Purchase Outcome by Visitor Type",
+    x = "Visitor Type",
+    y = "Proportion of Sessions",
+    fill = "Purchase"
+  ) +
+  theme_minimal()
+
+# Step 21: Purchase proportion by visitor type
+purchase_summary <- aggregate(
+  I(Revenue == "TRUE") ~ VisitorType,
+  data = data,
+  FUN = mean
+)
+names(purchase_summary)[2] <- "Purchase_Proportion"
+purchase_summary$Sessions <- as.vector(table(data$VisitorType)[purchase_summary$VisitorType])
+purchase_summary$Purchase_Proportion <- round(purchase_summary$Purchase_Proportion, 4)
+purchase_summary
+```
+
+**Interpretation:** new visitors buy in a larger share of their sessions
+(`r round(100 * purchase_summary$Purchase_Proportion[purchase_summary$VisitorType == "New_Visitor"], 1)`%)
+than returning visitors
+(`r round(100 * purchase_summary$Purchase_Proportion[purchase_summary$VisitorType == "Returning_Visitor"], 1)`%),
+although returning visitors make up most sessions. The "Other" group is very small
+(`r purchase_summary$Sessions[purchase_summary$VisitorType == "Other"]` sessions), so its
+proportion is less reliable.
+
+## Purchase rate by month *(added)*
+
+```{r plot-month}
+# Months are re-ordered in calendar order for the chart only.
+# (The model in Section 5 uses the original factor; this re-ordering does not affect it.)
+month_order <- c("Feb", "Mar", "May", "June", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+month_summary <- data %>%
+  mutate(Month = factor(Month, levels = month_order)) %>%
+  group_by(Month) %>%
+  summarise(Sessions = n(),
+            Purchase_Rate = round(mean(Revenue == "TRUE"), 4))
+
+ggplot(month_summary, aes(x = Month, y = Purchase_Rate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = paste0(round(100 * Purchase_Rate, 1), "%")), vjust = -0.4, size = 3.2) +
+  labs(
+    title = "Purchase Rate by Month",
+    x = "Month",
+    y = "Share of Sessions Ending in a Purchase"
+  ) +
+  theme_minimal()
+
+month_summary
+```
+
+**Interpretation:** the purchase rate is highest in
+**`r as.character(month_summary$Month[which.max(month_summary$Purchase_Rate)])`**
+(`r round(100 * max(month_summary$Purchase_Rate), 1)`%) and lowest in
+**`r as.character(month_summary$Month[which.min(month_summary$Purchase_Rate)])`**
+(`r round(100 * min(month_summary$Purchase_Rate), 1)`%). The number of sessions also
+differs a lot between months, so months with few sessions should be read with care.
+
+## Correlation between numerical variables *(added)*
+
+```{r plot-correlation, fig.height = 5.5}
+# Correlation matrix of the 10 numerical variables
+num_cols <- c("Administrative", "Administrative_Duration", "Informational",
+              "Informational_Duration", "ProductRelated", "ProductRelated_Duration",
+              "BounceRates", "ExitRates", "PageValues", "SpecialDay")
+cor_matrix <- cor(data[, num_cols])
+
+# Reshape the matrix into a long table (Var1, Var2, Correlation) for ggplot
+cor_long <- as.data.frame(as.table(cor_matrix))
+names(cor_long) <- c("Var1", "Var2", "Correlation")
+
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 2.6) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(
+    title = "Correlation Heatmap of Numerical Variables",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretation:** each page count is strongly correlated with its own duration
+(for example `ProductRelated` vs `ProductRelated_Duration`: r =
+`r round(cor_matrix["ProductRelated", "ProductRelated_Duration"], 2)`), and
+`BounceRates` is strongly correlated with `ExitRates` (r =
+`r round(cor_matrix["BounceRates", "ExitRates"], 2)`). These pairs carry overlapping
+information. Logistic Regression can still be fitted, but the individual
+coefficients of correlated variables should be interpreted with care.
+
+# Prediction / Model
+
+## Method and why it is suitable
+
+The target `Revenue` has two outcomes, so this is a **binary classification** problem.
+**Logistic Regression** (`glm()` with `family = binomial`) is used because it:
+
+* predicts the **probability** (0 to 1) that a session ends in a purchase;
+* is a standard, well-understood method for yes/no targets;
+* is simple and **interpretable**: each coefficient shows whether a variable raises or
+  lowers the chance of purchase.
+
+A probability is turned into a prediction using a **threshold**: if the probability is
+at or above the threshold, the prediction is `TRUE` (purchase).
+
+## Training and testing sets
+
+```{r split}
+# Step 11: Split data into training (80%) and testing (20%) sets.
+# set.seed() makes the random split the same every time the report is knitted.
+set.seed(123)
+
+train_index <- sample(
+  seq_len(nrow(data)),
+  size = floor(0.8 * nrow(data))
+)
+
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+
+# Check the split
+nrow(train_data)
+nrow(test_data)
+
+# Safety check: every Month level used by the model must appear in the training data,
+# otherwise predict() would fail on the test data.
+stopifnot(all(levels(data$Month) %in% unique(as.character(train_data$Month))))
+```
+
+## Model training
+
+The model uses the 10 numerical behaviour variables plus `Month`, `VisitorType` and
+`Weekend`, exactly as in the original script. `OperatingSystems`, `Browser`, `Region`
+and `TrafficType` are **not** used: they are technical codes with many rare values
+(some codes appear only once or twice), which can make `predict()` fail when a code
+appears in the test set but not in the training set.
+
+```{r model}
+# Step 12: Train the Logistic Regression model on the TRAINING data only.
+model <- glm(
+  Revenue ~ Administrative +
+    Administrative_Duration +
+    Informational +
+    Informational_Duration +
+    ProductRelated +
+    ProductRelated_Duration +
+    BounceRates +
+    ExitRates +
+    PageValues +
+    SpecialDay +
+    Month +
+    VisitorType +
+    Weekend,
+  data = train_data,
+  family = binomial
+)
+
+# Coefficient table (rounded).
+# Odds_Ratio = exp(Estimate): above 1 raises the odds of purchase, below 1 lowers them.
+coef_table <- as.data.frame(summary(model)$coefficients)
+names(coef_table) <- c("Estimate", "Std_Error", "z_value", "p_value")
+coef_table$Odds_Ratio  <- exp(coef_table$Estimate)
+coef_table$Significant <- ifelse(coef_table$p_value < 0.05, "Yes (p < 0.05)", "No")
+coef_table <- cbind(Term = rownames(coef_table), coef_table)
+rownames(coef_table) <- NULL
+coef_table[, 2:6] <- signif(coef_table[, 2:6], 4)
+coef_table
+```
+
+**Interpretation:** the significant variables (p < 0.05) are
+`r paste(setdiff(coef_table$Term[coef_table$p_value < 0.05], "(Intercept)"), collapse = ", ")`.
+`PageValues` is a strong positive predictor: each 1-unit increase multiplies the odds
+of purchase by about `r round(coef_table$Odds_Ratio[coef_table$Term == "PageValues"], 3)`.
+`ExitRates` has a strong negative effect. Month coefficients are compared with the
+reference month (`r levels(data$Month)[1]`, the first level alphabetically).
+
+## Prediction on the test data
+
+```{r predict}
+# Step 13: Predict purchase probabilities for the TEST sessions.
+probabilities <- predict(
+  model,
+  newdata = test_data,
+  type = "response"
+)
+
+predictions <- ifelse(
+  probabilities >= 0.5,
+  "TRUE",
+  "FALSE"
+)
+
+head(round(probabilities, 3), 10)
+head(predictions, 10)
+```
+
+## Evaluation at the standard threshold 0.50
+
+```{r evaluate-050}
+# Step 14: Model Evaluation (threshold 0.50)
+
+# Convert predictions and actual outcomes to factors with the same level order
+predicted_class <- factor(predictions, levels = c("FALSE", "TRUE"))
+actual_class    <- factor(test_data$Revenue, levels = c("FALSE", "TRUE"))
+
+# Create confusion matrix
+confusion_matrix <- table(Actual = actual_class, Predicted = predicted_class)
+print(confusion_matrix)
+
+# Extract confusion matrix values
+TN <- confusion_matrix["FALSE", "FALSE"]
+FP <- confusion_matrix["FALSE", "TRUE"]
+FN <- confusion_matrix["TRUE", "FALSE"]
+TP <- confusion_matrix["TRUE", "TRUE"]
+
+# Calculate evaluation metrics
+accuracy  <- (TP + TN) / sum(confusion_matrix)
+precision <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+recall    <- ifelse(TP + FN == 0, 0, TP / (TP + FN))
+f1_score  <- ifelse(precision + recall == 0, 0,
+                    2 * precision * recall / (precision + recall))
+
+cat("Accuracy:",  round(accuracy  * 100, 2), "%\n")
+cat("Precision:", round(precision * 100, 2), "%\n")
+cat("Recall:",    round(recall    * 100, 2), "%\n")
+cat("F1-score:",  round(f1_score  * 100, 2), "%\n")
+```
+
+At 0.50 the model is accurate overall but finds only
+`r round(100 * recall, 1)`% of the real purchases (`r TP` of `r TP + FN`).
+Because purchases are rare, the predicted probabilities are usually low, and a 0.50
+cut-off misses many buyers. A **lower threshold** catches more buyers.
+
+## Choosing a lower threshold
+
+To compare thresholds without repeating code, the same calculation as above is put
+into one small function.
+
+```{r metric-function}
+# Same formulas as Step 14, wrapped in a function so they can be reused.
+get_metrics <- function(probs, actual, threshold) {
+  predicted <- factor(ifelse(probs >= threshold, "TRUE", "FALSE"), levels = c("FALSE", "TRUE"))
+  actual    <- factor(actual, levels = c("FALSE", "TRUE"))
+  cm <- table(Actual = actual, Predicted = predicted)
+  TN <- cm["FALSE", "FALSE"]; FP <- cm["FALSE", "TRUE"]
+  FN <- cm["TRUE", "FALSE"];  TP <- cm["TRUE", "TRUE"]
+  precision <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  recall    <- ifelse(TP + FN == 0, 0, TP / (TP + FN))
+  data.frame(
+    Threshold = threshold,
+    Accuracy  = (TP + TN) / sum(cm),
+    Precision = precision,
+    Recall    = recall,
+    F1_score  = ifelse(precision + recall == 0, 0,
+                       2 * precision * recall / (precision + recall))
+  )
+}
+```
+
+**Original approach (exploratory).** The original script also tried a threshold of
+**0.30**. That value was chosen *after looking at the test-set results*. Once the test
+set has been used to choose a setting, it is no longer an independent check, so the
+0.30 result is likely to be slightly optimistic.
+
+**Revised approach (used for the final result).** The threshold is chosen using the
+**training data only**: we try thresholds from 0.05 to 0.95 and keep the one with the
+highest F1-score on the training sessions. The test set is then used **once** to
+evaluate that choice.
+
+```{r threshold-selection}
+# Predicted probabilities for the TRAINING sessions
+train_probabilities <- predict(model, newdata = train_data, type = "response")
+
+# Try thresholds 0.05, 0.10, ..., 0.95 on the training data
+threshold_grid <- round(seq(0.05, 0.95, by = 0.05), 2)
+train_scores <- do.call(rbind, lapply(threshold_grid, function(t)
+  get_metrics(train_probabilities, train_data$Revenue, t)))
+
+best_threshold <- train_scores$Threshold[which.max(train_scores$F1_score)]
+cat("Threshold with the highest training F1-score:", best_threshold, "\n")
+```
+
+```{r plot-threshold}
+# Training-data precision, recall and F1-score at each threshold
+threshold_long <- rbind(
+  data.frame(Threshold = train_scores$Threshold, Metric = "Precision", Value = train_scores$Precision),
+  data.frame(Threshold = train_scores$Threshold, Metric = "Recall",    Value = train_scores$Recall),
+  data.frame(Threshold = train_scores$Threshold, Metric = "F1-score",  Value = train_scores$F1_score)
+)
+
+ggplot(threshold_long, aes(x = Threshold, y = Value, colour = Metric)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.3) +
+  geom_vline(xintercept = best_threshold, linetype = "dashed") +
+  annotate("text", x = best_threshold + 0.02, y = 0.05, hjust = 0,
+           label = paste("chosen threshold =", best_threshold)) +
+  labs(
+    title = "Choosing the Threshold on the Training Data",
+    x = "Classification Threshold",
+    y = "Metric Value (training data)",
+    colour = "Metric"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation:** lowering the threshold raises recall (more buyers found) but lowers
+precision (more false alarms). F1-score balances the two and is highest on the training
+data at **`r best_threshold`**.
+
+```{r evaluate-thresholds}
+# Step 19 (extended): evaluate the thresholds on the TEST data
+results <- rbind(
+  cbind(Approach = "Original: standard threshold",          get_metrics(probabilities, test_data$Revenue, 0.50)),
+  cbind(Approach = "Original: exploratory (chosen on test)", get_metrics(probabilities, test_data$Revenue, 0.30)),
+  cbind(Approach = "Revised: chosen on training data",       get_metrics(probabilities, test_data$Revenue, best_threshold))
+)
+results_percent <- results
+results_percent[, 3:6] <- round(100 * results_percent[, 3:6], 2)
+results_percent
+
+# Confusion matrix at the chosen threshold
+final_predictions <- factor(ifelse(probabilities >= best_threshold, "TRUE", "FALSE"),
+                            levels = c("FALSE", "TRUE"))
+final_cm <- table(Actual = actual_class, Predicted = final_predictions)
+final_cm
+
+# Save the results table (all values as proportions, 4 decimals)
+results_to_save <- results
+results_to_save[, 3:6] <- round(results_to_save[, 3:6], 4)
+write.csv(results_to_save, "model_evaluation_results.csv", row.names = FALSE)
+```
+
+All values above are percentages on the `r nrow(test_data)` test sessions.
+`model_evaluation_results.csv` is saved in the project folder. It now also records
+which threshold and approach each row belongs to; the original file stored only the
+0.30 row.
+
+## Prediction plot
+
+```{r plot-predictions, fig.height = 4.8}
+# Distribution of predicted purchase probabilities on the TEST data,
+# shown separately for sessions that really did / did not end in a purchase.
+plot_df <- data.frame(
+  Probability = probabilities,
+  Actual = ifelse(test_data$Revenue == "TRUE", "Actual: purchase", "Actual: no purchase")
+)
+
+ggplot(plot_df, aes(x = Probability, fill = Actual)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, colour = "white") +
+  geom_vline(xintercept = 0.50, linetype = "dotted") +
+  geom_vline(xintercept = best_threshold, linetype = "dashed") +
+  facet_wrap(~ Actual, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Predicted Purchase Probability on the Test Data",
+    subtitle = paste0("Dotted line: threshold 0.50   |   Dashed line: chosen threshold ", best_threshold),
+    x = "Predicted Probability of Purchase",
+    y = "Number of Sessions"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Interpretation:** most non-purchase sessions receive probabilities close to 0, which
+is why accuracy is high. Many real purchase sessions fall **between** the two lines;
+moving the threshold from 0.50 down to `r best_threshold` turns these into correct
+"purchase" predictions, which is why recall improves.
+
+## Robustness checks *(added)*
+
+Two checks test whether the conclusions depend on decisions made earlier. Each uses
+the same steps as the main model: 80/20 split with `set.seed(123)`, threshold chosen on
+training data, one evaluation on the test data.
+
+```{r robustness}
+# Re-runs the full procedure (split -> fit -> choose threshold on train -> test once)
+run_procedure <- function(df, formula, label, seed = 123) {
+  set.seed(seed)
+  idx <- sample(seq_len(nrow(df)), size = floor(0.8 * nrow(df)))
+  tr <- df[idx, ]; te <- df[-idx, ]
+  m  <- glm(formula, data = tr, family = binomial)
+  p_tr <- predict(m, newdata = tr, type = "response")
+  scores <- do.call(rbind, lapply(threshold_grid, function(t) get_metrics(p_tr, tr$Revenue, t)))
+  t_best <- scores$Threshold[which.max(scores$F1_score)]
+  cbind(Model = label, get_metrics(predict(m, newdata = te, type = "response"), te$Revenue, t_best))
+}
+
+main_formula <- formula(model)
+
+robustness <- rbind(
+  run_procedure(data, main_formula, "Main model (duplicates kept)"),
+  run_procedure(data[!duplicated(data), ], main_formula, "Duplicates removed"),
+  run_procedure(data, update(main_formula, . ~ . - PageValues), "Without PageValues")
+)
+robustness[, 3:6] <- round(100 * robustness[, 3:6], 2)
+robustness
+```
+
+A single split can move the numbers by a few points, depending on which sessions land
+in the test set. To separate that effect from the duplicate decision, the full procedure
+is repeated with 30 different random splits (seeds 1 to 30).
+
+```{r repeated-splits, warning = FALSE}
+# warning = FALSE: with a few of the 30 splits, glm() prints the message
+# "fitted probabilities numerically 0 or 1 occurred". This only means some sessions
+# are predicted with near-certainty; it does not stop the model from fitting.
+split_seeds <- 1:30
+f1_kept    <- sapply(split_seeds, function(s)
+  run_procedure(data, main_formula, "kept", seed = s)$F1_score)
+f1_removed <- sapply(split_seeds, function(s)
+  run_procedure(data[!duplicated(data), ], main_formula, "removed", seed = s)$F1_score)
+
+repeated <- data.frame(
+  Data = c("Duplicates kept", "Duplicates removed"),
+  Mean_F1 = round(100 * c(mean(f1_kept), mean(f1_removed)), 2),
+  Min_F1  = round(100 * c(min(f1_kept),  min(f1_removed)), 2),
+  Max_F1  = round(100 * c(max(f1_kept),  max(f1_removed)), 2)
+)
+repeated
+```
+
+```{r pagevalues-check}
+# Purchase rate for sessions with and without a positive PageValue
+data %>%
+  mutate(PageValues_group = ifelse(PageValues > 0, "PageValues > 0", "PageValues = 0")) %>%
+  group_by(PageValues_group) %>%
+  summarise(Sessions = n(), Purchase_Rate = round(mean(Revenue == "TRUE"), 4))
+```
+
+**Interpretation:**
+
+* **Duplicates:** in the single split above, the F1-score is
+  `r robustness$F1_score[1]`% with duplicates kept and `r robustness$F1_score[2]`% with
+  them removed. Averaged over 30 different splits, the two are almost the same
+  (`r repeated$Mean_F1[1]`% vs `r repeated$Mean_F1[2]`%). The gap in the single split
+  therefore comes from *which sessions land in the test set*, not from the duplicates,
+  and keeping them does not change the conclusions.
+* **Split-to-split variation:** across the 30 splits, the main model's F1-score ranges
+  from `r repeated$Min_F1[1]`% to `r repeated$Max_F1[1]`%. The reported result with
+  `set.seed(123)` (`r robustness$F1_score[1]`%) lies inside this range, towards its
+  lower end, so it is not an unusually lucky split.
+* **PageValues:** without `PageValues`, the F1-score drops sharply, so this one variable
+  carries most of the predictive power. Google Analytics calculates a page's value from
+  purchases that happened after visitors viewed that page. The value may therefore
+  partly reflect the purchase itself, and might not be fully known early in a session.
+  The main model's results should be read as **an upper estimate** of what a real-time
+  system could achieve.
+
+# Results and Conclusion
+
+## Key findings
+
+* Only `r revenue_table$Percent[revenue_table$Revenue == "TRUE"]`% of
+  `r format(nrow(data), big.mark = ",")` sessions end in a purchase; the data is imbalanced.
+* Purchasing sessions have **lower bounce and exit rates** and much **higher page values**:
+  `r round(100 * mean(data$Revenue[data$PageValues > 0] == "TRUE"), 1)`% of sessions with a
+  positive page value end in a purchase, against
+  `r round(100 * mean(data$Revenue[data$PageValues == 0] == "TRUE"), 1)`% of the rest.
+* **New visitors** convert at a higher rate than returning visitors.
+* The purchase rate varies by **month**, highest in
+  `r as.character(month_summary$Month[which.max(month_summary$Purchase_Rate)])`.
+
+## Model results (test data, `r nrow(test_data)` sessions)
+
+```{r final-summary}
+# Step 23: Final case study summary
+final_row <- results[results$Approach == "Revised: chosen on training data", ]
+
+cat("Total sessions:", nrow(data), "\n")
+cat("Total variables:", ncol(data), "\n")
+cat("Training sessions:", nrow(train_data), "\n")
+cat("Testing sessions:", nrow(test_data), "\n")
+cat("Chosen threshold (from training data):", best_threshold, "\n")
+cat("Accuracy:",  round(final_row$Accuracy  * 100, 2), "%\n")
+cat("Precision:", round(final_row$Precision * 100, 2), "%\n")
+cat("Recall:",    round(final_row$Recall    * 100, 2), "%\n")
+cat("F1-score:",  round(final_row$F1_score  * 100, 2), "%\n")
+```
+
+With the threshold chosen on the training data, the Logistic Regression model reaches
+an accuracy of `r round(100 * final_row$Accuracy, 2)`% and an F1-score of
+`r round(100 * final_row$F1_score, 2)`% on unseen test sessions. It finds
+`r round(100 * final_row$Recall, 1)`% of real purchases, compared with
+`r round(100 * recall, 1)`% at the standard 0.50 threshold. This revised F1-score is very
+close to the original exploratory result at 0.30
+(`r round(100 * results$F1_score[2], 2)`%), which supports the decision to use a lower
+threshold.
+
+## Recommendations
+
+1. **Reduce early exits.** High exit and bounce rates go with non-purchase; improving
+   landing pages and navigation could keep more visitors in the session.
+2. **Focus on high-value pages.** Sessions that reach pages with a positive page value
+   are far more likely to buy; guide visitors towards these pages (product details,
+   cart, offers).
+3. **Win back returning visitors.** Returning visitors buy less often per session;
+   reminders or personalised offers may raise their conversion.
+4. **Plan by season.** Use the monthly differences to time campaigns and stock.
+
+## Limitations
+
+* **Threshold selection:** the final threshold is chosen on the training data, so it is
+  slightly fitted to that data. A separate validation set or cross-validation would be
+  stricter. The original 0.30 result was chosen on the test set and is exploratory only.
+* **Single random split:** the main results come from one 80/20 split (`set.seed(123)`).
+  Other splits give F1-scores between `r repeated$Min_F1[1]`% and `r repeated$Max_F1[1]`%
+  (Section 5.8).
+* **PageValues:** it may partly reflect the purchase itself (Section 5.8), so performance
+  may be optimistic for real-time prediction.
+* **Duplicates:** `r sum(duplicated(data))` identical rows were kept (Section 3.2); some of
+  them fall into both the training and test sets.
+* **Scope:** the data covers one year of one online store, so findings may not apply to
+  other websites. Logistic Regression assumes a linear relationship on the log-odds
+  scale and may miss more complex patterns.
+
+## Conclusion
+
+Session behaviour, especially page value, exit rate and visitor type, is clearly
+associated with whether an online shopping session ends in a purchase. A simple,
+interpretable Logistic Regression model built in R predicts purchases with high accuracy.
+Choosing a lower threshold on the training data greatly improves how many buyers it
+finds. All results in this report are produced by the R code above from the original
+UCI dataset.
+
+# References
+
+1. Sakar, C. O., & Kastro, Y. (2018). *Online Shoppers Purchasing Intention Dataset* [Dataset]. UCI Machine Learning Repository. <https://doi.org/10.24432/C5F88Q>
+2. Sakar, C. O., Polat, S. O., Katircioglu, M., & Kastro, Y. (2019). Real-time prediction of online shoppers' purchasing intention using multilayer perceptron and LSTM recurrent neural networks. *Neural Computing and Applications, 31*(10), 6893–6908. <https://doi.org/10.1007/s00521-018-3523-0>
+3. R Core Team. *R: A Language and Environment for Statistical Computing* (`r R.version.string`). R Foundation for Statistical Computing, Vienna, Austria. <https://www.R-project.org/>
+4. Wickham, H. (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer-Verlag New York. (package version `r packageVersion("ggplot2")`)
+5. Wickham, H., François, R., Henry, L., Müller, K., & Vaughan, D. *dplyr: A Grammar of Data Manipulation*. R package version `r packageVersion("dplyr")`. <https://CRAN.R-project.org/package=dplyr>
+6. Allaire, J. J., Xie, Y., et al. *rmarkdown: Dynamic Documents for R*. R package version `r packageVersion("rmarkdown")`. <https://CRAN.R-project.org/package=rmarkdown>
+
+# Appendix: Reproducibility
+
+```{r session-info}
+# R version and package versions used to produce this report
+sessionInfo()
+```
